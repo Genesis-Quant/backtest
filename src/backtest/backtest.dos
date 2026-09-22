@@ -1,0 +1,81 @@
+// Run in a DolphinDB session with Backtest already loaded.
+def initialize(mutable ctx) {
+    ctx["orders"] = array(ANY, 0)
+    ctx["trades"] = array(ANY, 0)
+}
+def beforeTrading(mutable ctx) {}
+def afterTrading(mutable ctx) {}
+def finalize(mutable ctx) {}
+def onSnapshot(mutable ctx, msg, indicator) {}
+def onOrder(mutable ctx, orders) {
+    for (order in orders) ctx["orders"].append!(dict(order.keys(), each(copy, order.values())))
+}
+def onTrade(mutable ctx, trades) {
+    for (trade in trades) ctx["trades"].append!(dict(trade.keys(), each(copy, trade.values())))
+}
+
+def advance(engine, msg) {
+    stat = Backtest::getBacktestEngineStat(engine)
+    if (stat.status[0]=="FATAL") throw "Backtest engine is FATAL: " + stat.lastErrMsg[0]
+    Backtest::appendQuotationMsg(engine, msg)
+}
+
+def submitOrder(engine, order, label="", orderType=0, algoOrderParam=NULL) {
+    if (orderType in [10,11]) {
+        params = copy(algoOrderParam)
+        params["endTime"] = second(params["endTime"])
+        if ("startTime" in params.keys()) params["startTime"] = second(params["startTime"])
+        return Backtest::submitOrder(engine, order, label, orderType,,params)
+    }
+    return Backtest::submitOrder(engine, order, label, orderType)
+}
+
+def setTradingVolumeDist(engine, volume) {
+    Backtest::setTradingVolumeDist(engine, volume)
+}
+
+def cancelOrder(engine, symbol="", orders=NULL, label="") {
+    return Backtest::cancelOrder(engine, symbol, orders, label)
+}
+
+def getPosition(engine) {
+    return Backtest::getPosition(engine)
+}
+
+def getContext(engine) {
+    return Backtest::getContextDict(engine)
+}
+
+def getOrders(engine, clear=false) {
+    ctx = Backtest::getContextDict(engine)
+    orders = ctx["orders"]
+    if (clear) ctx["orders"] = array(ANY,0)
+    return orders
+}
+
+def getTrades(engine, clear=false) {
+    ctx = Backtest::getContextDict(engine)
+    trades = ctx["trades"]
+    if (clear) ctx["trades"] = array(ANY,0)
+    return trades
+}
+
+def getTradeDetails(engine) {
+    return Backtest::getTradeDetails(engine)
+}
+
+def getDailyPosition(engine) {
+    return Backtest::getDailyPosition(engine)
+}
+
+def getDailyTotalPortfolios(engine) {
+    return Backtest::getDailyTotalPortfolios(engine)
+}
+
+def getDailyTradingStatistics(engine) {
+    return Backtest::getDailyTradingStatistics(engine)
+}
+
+def dropEngine(engine) {
+    Backtest::dropBacktestEngine(engine)
+}

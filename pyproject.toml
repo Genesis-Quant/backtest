@@ -1,0 +1,30 @@
+[project]
+name = "backtest"
+version = "0.1.0"
+description = "Python-driven DolphinDB backtesting with composable algorithms."
+requires-python = ">=3.12"
+dependencies = [
+    "dolphindb==3.0.4.2",
+    "numpy>=2.0,<3",
+    "pydantic>=2.0,<3",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF022"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
