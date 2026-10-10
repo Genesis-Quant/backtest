@@ -273,7 +273,13 @@ class Backtest[C: BaseModel](ABC):
             )
         else:
             order_id = int(self.session.run("submitOrder(engine, orderMsg, orderLabel, orderKind)[0]"))
-        logger.debug("提交订单 #%d：%r", order_id, order)
+        if logger.isEnabledFor(logging.DEBUG):
+            price = getattr(order, "price", None)
+            logger.debug(
+                "提交订单 #%d：%s %s %s %d 股 @ %s%s", order_id, type(order).__name__,
+                order.direction.name, order.symbol, order.quantity,
+                f"{price:g}" if price else "市价", f"，标签 {order.label}" if order.label else "",
+            )
         return order_id
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:

@@ -1,13 +1,14 @@
 """回放日志：用假会话驱动时间线，不连接 DolphinDB。"""
 
 import logging
+from datetime import datetime
 
 import numpy as np
 import pytest
 from pydantic import BaseModel
 
 import backtest.backtest as module
-from backtest import Algo, Backtest, DosVar
+from backtest import Algo, Backtest, Direction, DosVar, LimitOrder, MarketOrder
 
 
 class Context(BaseModel):
@@ -48,6 +49,8 @@ class FakeSession:
             return self.current
         if script.startswith("size("):
             return 3 * len(self.current)
+        if script.startswith("submitOrder("):
+            return 7
         if "getOrders(engine, true)" in script or "getTrades(engine, true)" in script:
             return []
         return None
@@ -111,6 +114,25 @@ def test_debug_shows_engine_batches_and_replay_totals(session, caplog):
     assert debug[-2].startswith("回放完成：2 个批次、2 个行情时点，用时 ")
     assert debug[-1] == "释放回测引擎与会话"
     assert "secret" not in caplog.text
+
+
+def test_order_submission_is_one_compact_debug_line(session, caplog):
+    caplog.set_level(logging.DEBUG, logger="backtest")
+    moment = datetime(2023, 1, 3, 9, 30)
+    with Replay(
+        "localhost", 8848, "user", "secret", engine_name="probe",
+        config={"startDate": "2023-01-03", "endDate": "2023-01-04"}, ctx=Context(),
+    ) as engine:
+        engine.submit_order(LimitOrder(
+            symbol="600000.XSHG", time=moment, quantity=200, direction=Direction.BUY_OPEN,
+            price=10.5, label="rebalance",
+        ))
+        engine.submit_order(MarketOrder(
+            symbol="000001.XSHE", time=moment, quantity=100, direction=Direction.SELL_CLOSE,
+        ))
+    debug = messages(caplog, logging.DEBUG)
+    assert "提交订单 #7：LimitOrder BUY_OPEN 600000.XSHG 200 股 @ 10.5，标签 rebalance" in debug
+    assert "提交订单 #7：MarketOrder SELL_CLOSE 000001.XSHE 100 股 @ 市价" in debug
 
 
 def test_window_keeps_intraday_bounds_half_open():
