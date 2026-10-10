@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from importlib.resources import files
+from time import perf_counter
 from types import TracebackType
 from typing import Any, Self, Sequence, final
 
@@ -30,6 +32,30 @@ from .orders import Order
 from .types import DosRecord, DosVar
 
 __all__ = ["Backtest"]
+
+# 库只产生标准库日志，由使用方配置输出与级别。
+logger = logging.getLogger("backtest")
+
+
+def _moment(value: np.datetime64) -> str:
+    """日级时点只显示日期，盘中时点精确到秒。"""
+    text = np.datetime_as_string(value, unit="s").replace("T", " ")
+    return text.removesuffix(" 00:00:00")
+
+
+def _span(value: np.timedelta64) -> str:
+    days, remainder = divmod(value, np.timedelta64(1, "D"))
+    return f"{int(days)} 天" if remainder == np.timedelta64(0, "D") else str(value)
+
+
+def _window(start: np.datetime64, end: np.datetime64) -> str:
+    """把 [start, end) 显示为日期或含结束日的日期区间，盘中边界保留半开写法。"""
+    day = np.timedelta64(1, "D")
+    if (start - start.astype("datetime64[D]")) or (end - end.astype("datetime64[D]")):
+        return f"[{_moment(start)}, {_moment(end)})"
+    if end - start == day:
+        return _moment(start)
+    return f"{_moment(start)} 至 {_moment(end - day)}"
 
 
 class Backtest[C: BaseModel](ABC):
@@ -94,6 +120,13 @@ class Backtest[C: BaseModel](ABC):
         except Exception:
             self.session.close()
             raise
+        logger.debug(
+            "回测引擎 %s 已创建：%s 至 %s，Algo %s",
+            engine_name,
+            self.config["startDate"],
+            self.config["endDate"],
+            " → ".join(type(algo).__name__ for algo in self.algos) or "无",
+        )
 
     @abstractmethod
     def load_messages(self, start: np.datetime64, end: np.datetime64) -> DosVar:
@@ -116,33 +149,56 @@ class Backtest[C: BaseModel](ABC):
         start = np.datetime64(self.config["startDate"], "ms")
         end = np.datetime64(self.config["endDate"], "ms") + np.timedelta64(1, "D")
         last_time: np.datetime64 | None = None
+        started = perf_counter()
+        batches = moments = 0
+        logger.debug("开始回放 %s，每批 %s", _window(start, end), _span(batch_size))
         while start < end:
             batch_end = min(start + batch_size, end)
+            loading = perf_counter()
             message = self.load_messages(start, batch_end)
             timeline: np.ndarray = self.session.run(f"sort(distinct({message}.timestamp))")
             if len(timeline) and (timeline[0] < start or timeline[-1] >= batch_end):
                 raise ValueError("load_messages 返回了 [start, end) 之外的行情")
+            batches += 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "批次 %s：%d 行行情、%d 个时点，加载 %.2f 秒",
+                    _window(start, batch_end), self.session.run(f"size({message})"),
+                    len(timeline), perf_counter() - loading,
+                )
             start = batch_end
             if len(timeline) == 0:
                 continue
             if last_time is None:
                 self.time = timeline[0]
+                logger.info("首个行情时点 %s，初始化 %d 个 Algo", _moment(timeline[0]), len(self.algos))
                 self.initialize()
             for self.time in timeline:
                 self.session.upload({"inputTime": self.time})
                 self.session.run(f"msg = select * from {message} where timestamp=inputTime")
                 self.advance(DosVar("msg"))
                 self.process_events(DosVar("msg"))
+            moments += len(timeline)
             last_time = self.time
         if last_time is None:
             raise ValueError("行情为空")
         self.finish(DosVar("msg"))
+        logger.debug(
+            "回放完成：%d 个批次、%d 个行情时点，用时 %.1f 秒", batches, moments, perf_counter() - started
+        )
 
     @final
     def initialize(self) -> None:
         """按传入顺序初始化 Algo；run 在第一份行情进入插件前调用。"""
         for algo in self.algos:
+            started = perf_counter()
             algo.initialize()
+            seconds = perf_counter() - started
+            # 训练、预加载等耗时初始化值得在默认级别显示，瞬时完成的只在调试时显示。
+            logger.log(
+                logging.INFO if seconds >= 1 else logging.DEBUG,
+                "%s 初始化完成，用时 %.2f 秒", type(algo).__name__, seconds,
+            )
 
     @final
     def on_snapshot(self, msg: DosVar) -> None:
@@ -173,8 +229,10 @@ class Backtest[C: BaseModel](ABC):
         """
         while True:
             if len(orders := self.session.run("getOrders(engine, true)")):
+                logger.debug("分发 %d 条订单回报", len(orders))
                 self.on_order([OrderReport.model_validate(order) for order in orders])
             elif len(trades := self.session.run("getTrades(engine, true)")):
+                logger.debug("分发 %d 条成交回报", len(trades))
                 self.on_trade([TradeReport.model_validate(trade) for trade in trades])
             elif msg is not None:
                 current_msg, msg = msg, None
@@ -208,12 +266,15 @@ class Backtest[C: BaseModel](ABC):
         )
         if (params := order.algo_params()) is not None:
             self.session.upload({"algoOrderParam": params})
-            return int(
+            order_id = int(
                 self.session.run(
                     "submitOrder(engine, orderMsg, orderLabel, orderKind, algoOrderParam)[0]"
                 )
             )
-        return int(self.session.run("submitOrder(engine, orderMsg, orderLabel, orderKind)[0]"))
+        else:
+            order_id = int(self.session.run("submitOrder(engine, orderMsg, orderLabel, orderKind)[0]"))
+        logger.debug("提交订单 #%d：%r", order_id, order)
+        return order_id
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:
         """设置 VWAP 拆量依据，volume 是当前会话内的成交量分布表名。
@@ -243,6 +304,7 @@ class Backtest[C: BaseModel](ABC):
             }
         )
         self.session.run("cancelOrder(engine, cancelSymbol, cancelIds, cancelLabel)")
+        logger.debug("提交撤单：symbol=%r orders=%s label=%r", symbol, list(orders or []), label)
 
     def get_records[T: DosRecord](self, query: str, model: type[T]) -> list[T]:
         """将 DOS 结果表按列取回、逐行转换为模型，避免生成 DataFrame。"""
@@ -309,11 +371,13 @@ class Backtest[C: BaseModel](ABC):
             endMsg = select top 1 * from {msg}
             update endMsg set symbol="END", timestamp=timestamp+1
         """)
+        logger.debug("发送 END 消息，完成日终与结束处理")
         self.advance(DosVar("endMsg"))
         self.process_events()
 
     def close(self) -> None:
         """删除当前回测引擎，并在删除失败时仍关闭 SDK 会话。"""
+        logger.debug("释放回测引擎与会话")
         try:
             self.session.run("dropEngine(engine)")
         finally:
