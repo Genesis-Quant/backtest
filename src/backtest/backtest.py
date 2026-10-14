@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from importlib.resources import files
 from time import perf_counter
 from types import TracebackType
-from typing import Any, Self, Sequence, final
+from typing import Any, Generic, Self, Sequence, TypeVar, final
 
 import dolphindb as ddb
 import numpy as np
@@ -32,6 +32,9 @@ from .orders import Order
 from .types import DosRecord, DosVar
 
 __all__ = ["Backtest"]
+
+C = TypeVar("C", bound=BaseModel, infer_variance=True)
+T = TypeVar("T", bound=DosRecord, infer_variance=True)
 
 # 库只产生标准库日志，由使用方配置输出与级别。
 logger = logging.getLogger("backtest")
@@ -58,7 +61,7 @@ def _window(start: np.datetime64, end: np.datetime64) -> str:
     return f"{_moment(start)} 至 {_moment(end - day)}"
 
 
-class Backtest[C: BaseModel](ABC):
+class Backtest(ABC, Generic[C]):
     """持有一个 DolphinDB 会话和引擎，组织股票快照回放与 Algo 回调。
 
     下单和账户记账由插件完成；Python 负责加载行情、推进时间和分发回报。
@@ -312,7 +315,7 @@ class Backtest[C: BaseModel](ABC):
         self.session.run("cancelOrder(engine, cancelSymbol, cancelIds, cancelLabel)")
         logger.debug("提交撤单：symbol=%r orders=%s label=%r", symbol, list(orders or []), label)
 
-    def get_records[T: DosRecord](self, query: str, model: type[T]) -> list[T]:
+    def get_records(self, query: str, model: type[T]) -> list[T]:
         """将 DOS 结果表按列取回、逐行转换为模型，避免生成 DataFrame。"""
         columns = self.session.run(f"result = {query}; dict(result.columnNames(), result.values())")
         return [

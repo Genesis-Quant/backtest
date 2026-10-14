@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Generic, Sequence, TypeVar
 
 from pydantic import BaseModel
 
@@ -13,8 +13,11 @@ if TYPE_CHECKING:
 
 __all__ = ["Algo"]
 
+P = TypeVar("P", infer_variance=True)
+C = TypeVar("C", bound=BaseModel, infer_variance=True)
 
-class Algo[P, C: BaseModel](ABC):
+
+class Algo(ABC, Generic[P, C]):
     """Python 侧算法基类；P 是算法参数类型，C 是共享上下文模型类型。
 
     回调返回 None，算法在回调内读取账户、下单或修改 ctx。

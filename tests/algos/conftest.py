@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack
 from datetime import datetime, timedelta
+from typing import TypeAlias
 from uuid import uuid4
 
 import numpy as np
@@ -63,7 +64,7 @@ class AlgoBacktest(Backtest[SharedContext]):
         self.advance(DosVar("msg"))
 
 
-type EngineFactory = Callable[
+EngineFactory: TypeAlias = Callable[
     [Sequence[Algo[str, SharedContext]], SharedContext | None], AlgoBacktest
 ]
 

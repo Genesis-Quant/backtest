@@ -3,7 +3,7 @@
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeAlias
 from uuid import uuid4
 
 import numpy as np
@@ -157,8 +157,8 @@ def make_strategy(connection: tuple[str, int, str, str]) -> Iterator[StrategyFac
         yield create
 
 
-type ExpectedFill = tuple[str, str, Direction, int, float]
-type ExpectedDay = tuple[str, float, float, dict[str, tuple[int, int]]]
+ExpectedFill: TypeAlias = tuple[str, str, Direction, int, float]
+ExpectedDay: TypeAlias = tuple[str, float, float, dict[str, tuple[int, int]]]
 
 
 def assert_fills(
