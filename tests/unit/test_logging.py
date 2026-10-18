@@ -49,7 +49,7 @@ class FakeSession:
             return self.current
         if script.startswith("size("):
             return 3 * len(self.current)
-        if script.startswith("submitOrder("):
+        if script.startswith("Backtest::submitOrder("):
             return 7
         if "getOrders(engine, true)" in script or "getTrades(engine, true)" in script:
             return []

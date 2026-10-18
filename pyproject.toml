@@ -1,6 +1,6 @@
 [project]
 name = "backtest"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python-driven DolphinDB backtesting with composable algorithms."
 requires-python = ">=3.12"
 dependencies = [

@@ -155,5 +155,5 @@ class EngineContext(DosRecord):
     tradeDate: date | None  # 交易日期，转换为 Python date。
     tradeTime: datetime | None  # 插件记录的最新行情时间，可能与 Python 通知时序不同。
     barTime: datetime | None  # 插件合成的当前 Bar 时间，未生成有效值时可能为空或初始时间。
-    orders: list[OrderReport]  # backtest.dos 累积、尚未被 Python 消费的订单回报。
-    trades: list[TradeReport]  # backtest.dos 累积、尚未被 Python 消费的成交回报。
+    orders: list[OrderReport]  # 会话内 DOS 回调累积、尚未被 Python 消费的订单回报。
+    trades: list[TradeReport]  # 会话内 DOS 回调累积、尚未被 Python 消费的成交回报。

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from importlib.resources import files
 from time import perf_counter
 from types import TracebackType
 from typing import Any, Generic, Self, Sequence, TypeVar, final
@@ -96,6 +95,8 @@ class Backtest(ABC, Generic[C]):
             algos: 按上游到下游排列；初始化正序，每次事件回调逆序。
 
         服务端须已加载 MatchingEngineSimulator 和 Backtest 插件。
+        在当前会话内定义插件反复调用的 DOS 回调与回报缓冲读取函数；
+        其他操作在对应 Python 方法中直接调用插件，无外部 DOS 脚本依赖。
         """
         self.config = {
             "enableAlgoOrder": True,
@@ -113,9 +114,34 @@ class Backtest(ABC, Generic[C]):
         try:
             if not self.session.connect(host, port, username, password):
                 raise ConnectionError("DolphinDB connection failed")
-            self.session.run(
-                files(__package__).joinpath("backtest.dos").read_text(encoding="utf-8")
-            )
+            self.session.run("""
+                def initialize(mutable ctx) {
+                    ctx["orders"] = array(ANY, 0)
+                    ctx["trades"] = array(ANY, 0)
+                }
+                def beforeTrading(mutable ctx) {}
+                def afterTrading(mutable ctx) {}
+                def finalize(mutable ctx) {}
+                def onSnapshot(mutable ctx, msg, indicator) {}
+                def onOrder(mutable ctx, orders) {
+                    for (order in orders) ctx["orders"].append!(dict(order.keys(), each(copy, order.values())))
+                }
+                def onTrade(mutable ctx, trades) {
+                    for (trade in trades) ctx["trades"].append!(dict(trade.keys(), each(copy, trade.values())))
+                }
+                def getOrders(engine, clear=false) {
+                    ctx = Backtest::getContextDict(engine)
+                    orders = ctx["orders"]
+                    if (clear) ctx["orders"] = array(ANY, 0)
+                    return orders
+                }
+                def getTrades(engine, clear=false) {
+                    ctx = Backtest::getContextDict(engine)
+                    trades = ctx["trades"]
+                    if (clear) ctx["trades"] = array(ANY, 0)
+                    return trades
+                }
+            """)
             self.session.upload({"engineName": engine_name, "config": self.config})
             self.session.run("""
                 engine = Backtest::createBacktestEngine(engineName,config,,initialize,beforeTrading,,onSnapshot,onOrder,onTrade,afterTrading,finalize)
@@ -246,11 +272,15 @@ class Backtest(ABC, Generic[C]):
     def advance(self, msg: DosVar) -> None:
         """将 msg 引用的表传给 appendQuotationMsg，推进插件撮合。
 
-        DOS 包装在追加前检查 FATAL 状态并抛错，异常经 SDK 传回 Python。
+        会话内 DOS 在追加前检查 FATAL 状态并抛错，异常经 SDK 传回 Python。
         本方法不更新 self.time、不分发 Python 回调；手动驱动时由调用者
         设置时间并随后调用 process_events。
         """
-        self.session.run(f"advance(engine, {msg})")
+        self.session.run(f"""
+            stat = Backtest::getBacktestEngineStat(engine)
+            if (stat.status[0]=="FATAL") throw "Backtest engine is FATAL: " + stat.lastErrMsg[0]
+            Backtest::appendQuotationMsg(engine, {msg})
+        """)
 
     def submit_order(self, order: Order) -> int:
         """提交单个订单对象，返回插件分配的订单号。
@@ -270,12 +300,17 @@ class Backtest(ABC, Generic[C]):
         if (params := order.algo_params()) is not None:
             self.session.upload({"algoOrderParam": params})
             order_id = int(
-                self.session.run(
-                    "submitOrder(engine, orderMsg, orderLabel, orderKind, algoOrderParam)[0]"
-                )
+                self.session.run("""
+                    params = copy(algoOrderParam)
+                    params["endTime"] = second(params["endTime"])
+                    if ("startTime" in params.keys()) params["startTime"] = second(params["startTime"])
+                    Backtest::submitOrder(engine, orderMsg, orderLabel, orderKind,,params)[0]
+                """)
             )
         else:
-            order_id = int(self.session.run("submitOrder(engine, orderMsg, orderLabel, orderKind)[0]"))
+            order_id = int(
+                self.session.run("Backtest::submitOrder(engine, orderMsg, orderLabel, orderKind)[0]")
+            )
         if logger.isEnabledFor(logging.DEBUG):
             price = getattr(order, "price", None)
             logger.debug(
@@ -291,7 +326,7 @@ class Backtest(ABC, Generic[C]):
         表列为 symbol（STRING/SYMBOL）、time（SECOND）、value（INT/DOUBLE）；
         value 表示成交量或相对权重。应在提交 VWAPOrder 前设置。
         """
-        self.session.run(f"setTradingVolumeDist(engine, {volume})")
+        self.session.run(f"Backtest::setTradingVolumeDist(engine, {volume})")
 
     def cancel_order(
         self,
@@ -312,7 +347,7 @@ class Backtest(ABC, Generic[C]):
                 "cancelIds": np.asarray(orders or [], dtype=np.int64),
             }
         )
-        self.session.run("cancelOrder(engine, cancelSymbol, cancelIds, cancelLabel)")
+        self.session.run("Backtest::cancelOrder(engine, cancelSymbol, cancelIds, cancelLabel)")
         logger.debug("提交撤单：symbol=%r orders=%s label=%r", symbol, list(orders or []), label)
 
     def get_records(self, query: str, model: type[T]) -> list[T]:
@@ -327,17 +362,17 @@ class Backtest(ABC, Generic[C]):
         """查询插件当前持仓，按 symbol 索引；无记录时返回空字典。"""
         return {
             position.symbol: position
-            for position in self.get_records("getPosition(engine)", Position)
+            for position in self.get_records("Backtest::getPosition(engine)", Position)
         }
 
     def get_context(self) -> EngineContext:
         """读取 DOS 引擎 context 的本次快照；修改返回模型不会写回服务端。"""
-        return EngineContext.model_validate(self.session.run("getContext(engine)"))
+        return EngineContext.model_validate(self.session.run("Backtest::getContextDict(engine)"))
 
     def get_orders(self) -> list[OrderReport]:
         """查看尚未被 process_events 消费的订单回报，不清空缓冲区。
 
-        这是 backtest.dos 提供的缓冲读取接口，不是活动委托查询 getOpenOrders。
+        这是会话内 DOS 回调的缓冲读取接口，不是活动委托查询 getOpenOrders。
         已分发的回报不再出现在此列表中。
         """
         return [
@@ -356,19 +391,19 @@ class Backtest(ABC, Generic[C]):
         统计成交时按 PARTIALLY_FILLED / FILLED 筛选；撤单记录的数量不能直接
         累加为成交量。完整结果应在 finish 后、close 前获取。
         """
-        return self.get_records("getTradeDetails(engine)", TradeDetail)
+        return self.get_records("Backtest::getTradeDetails(engine)", TradeDetail)
 
     def get_daily_position(self) -> list[DailyPosition]:
         """读取已生成的日终持仓记录；盘中实时持仓使用 get_position。"""
-        return self.get_records("getDailyPosition(engine)", DailyPosition)
+        return self.get_records("Backtest::getDailyPosition(engine)", DailyPosition)
 
     def get_daily_total_portfolios(self) -> list[DailyPortfolio]:
         """读取已生成的每日账户权益记录；最后一日需结束处理后才完整。"""
-        return self.get_records("getDailyTotalPortfolios(engine)", DailyPortfolio)
+        return self.get_records("Backtest::getDailyTotalPortfolios(engine)", DailyPortfolio)
 
     def get_daily_trading_statistics(self) -> list[DailyTradingStatistics]:
         """读取按标的、交易日统计的四种开平方向的成交量、金额和均价。"""
-        return self.get_records("getDailyTradingStatistics(engine)", DailyTradingStatistics)
+        return self.get_records("Backtest::getDailyTradingStatistics(engine)", DailyTradingStatistics)
 
     def finish(self, msg: DosVar) -> None:
         """基于最后一份非空行情构造 END 消息，完成日终与结束处理。
@@ -388,7 +423,7 @@ class Backtest(ABC, Generic[C]):
         """删除当前回测引擎，并在删除失败时仍关闭 SDK 会话。"""
         logger.debug("释放回测引擎与会话")
         try:
-            self.session.run("dropEngine(engine)")
+            self.session.run("Backtest::dropBacktestEngine(engine)")
         finally:
             self.session.close()
 

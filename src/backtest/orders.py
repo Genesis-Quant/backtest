@@ -244,7 +244,7 @@ class TWAPOrder(LimitOrder):
     """
 
     kind: ClassVar[OrderKind] = OrderKind.TWAP
-    end_time: time  # 当日拆单结束时间，DOS 包装转换为 SECOND。
+    end_time: time  # 当日拆单结束时间，提交时由会话内 DOS 转换为 SECOND。
     start_time: time | None = None  # 当日开始时间；None 时省略该键。
     interval: int = Field(default=20, gt=0)  # 切分间隔，单位秒，上传为 INT。
     max_single_order_volume: int | None = Field(
@@ -253,7 +253,7 @@ class TWAPOrder(LimitOrder):
     order_price_type: AlgoPriceType = AlgoPriceType.LAST  # 子单取价依据。
 
     def algo_params(self) -> dict[str, Any]:
-        """构造插件参数字典，开始/结束时间由 backtest.dos 转成 SECOND。"""
+        """构造插件参数字典，提交时由会话内 DOS 将开始/结束时间转成 SECOND。"""
         params: dict[str, Any] = {
             "endTime": self.end_time.isoformat(),
             "interval": np.int32(self.interval),
