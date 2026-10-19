@@ -1,6 +1,7 @@
 """会话内 DOS 定义及插件直调用契约；使用 SDK 替身，不连接 DolphinDB。"""
 
 import ast
+import logging
 import re
 from collections.abc import Iterator
 from datetime import datetime, time
@@ -53,6 +54,66 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> Iterator[SessionBacktest]:
     yield instance
     session.run.side_effect = None
     instance.close()
+
+
+@pytest.mark.parametrize("failure", ["session", "connect_false", "connect_error", "callbacks", "upload", "engine"])
+def test_constructor_failure_closes_created_session_without_logging_secrets(monkeypatch, caplog, failure):
+    caplog.set_level(logging.DEBUG, logger="backtest")
+    session = Mock()
+    session.connect.return_value = failure != "connect_false"
+    error = RuntimeError("password-sentinel config-sentinel")
+    if failure == "connect_error":
+        session.connect.side_effect = error
+    elif failure == "callbacks":
+        session.run.side_effect = error
+    elif failure == "upload":
+        session.upload.side_effect = error
+    elif failure == "engine":
+        session.run.side_effect = [None, error]
+    factory = Mock(return_value=session, side_effect=error if failure == "session" else None)
+    monkeypatch.setattr(module.ddb, "session", factory)
+    expected = ConnectionError if failure == "connect_false" else RuntimeError
+    with pytest.raises(expected):
+        SessionBacktest("ddb.example", 8900, "user-sentinel", "password-sentinel", engine_name="failure",
+                        config={"startDate": "2026-06-10", "endDate": "2026-06-10"}, ctx=Context())
+    assert session.close.call_count == int(failure != "session")
+    if failure == "session":
+        session.connect.assert_not_called()
+    else:
+        session.connect.assert_called_once_with("ddb.example", 8900, "user-sentinel", "password-sentinel")
+    assert "password-sentinel" not in caplog.text
+    assert "config-sentinel" not in caplog.text
+    assert "user-sentinel" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["drop", "close", "both"])
+def test_close_always_closes_session_and_preserves_native_failure_order(engine, failure):
+    session = engine.session
+    drop_error = ValueError("drop failed")
+    close_error = OSError("close failed")
+    events = []
+    def drop(script):
+        assert script == "Backtest::dropBacktestEngine(engine)"
+        events.append("drop")
+        if failure in ("drop", "both"):
+            raise drop_error
+    def close():
+        events.append("close")
+        if failure in ("close", "both"):
+            raise close_error
+    session.run.side_effect = drop
+    session.close.side_effect = close
+    try:
+        expected = drop_error if failure == "drop" else close_error
+        with pytest.raises(type(expected)) as caught:
+            engine.close()
+        assert caught.value is expected
+        assert events == ["drop", "close"]
+        if failure == "both":
+            assert caught.value.__context__ is drop_error
+    finally:
+        session.run.side_effect = None
+        session.close.side_effect = None
 
 
 def test_no_external_dos_resource() -> None:

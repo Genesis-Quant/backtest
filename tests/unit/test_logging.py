@@ -1,4 +1,4 @@
-"""回放日志：用假会话驱动时间线，不连接 DolphinDB。"""
+"""回放日志分级，不连接 DolphinDB。"""
 
 import logging
 from datetime import datetime
@@ -15,28 +15,14 @@ class Context(BaseModel):
     pass
 
 
-class Clock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
 class Probe(Algo[None, Context]):
     def initialize(self) -> None:
         self.ready = True
 
 
-class Slow(Algo[Clock, Context]):
-    def initialize(self) -> None:
-        self.params.now += 2.5
-
-
 class FakeSession:
     def __init__(self, batches: list[list[str]]) -> None:
         self.batches = [np.array(batch, dtype="datetime64[ms]") for batch in batches]
-        self.current = self.batches[0]
         self.scripts: list[str] = []
 
     def connect(self, *args: object) -> bool:
@@ -45,10 +31,7 @@ class FakeSession:
     def run(self, script: str) -> object:
         self.scripts.append(script)
         if script.startswith("sort(distinct("):
-            self.current = self.batches.pop(0)
-            return self.current
-        if script.startswith("size("):
-            return 3 * len(self.current)
+            return self.batches.pop(0)
         if script.startswith("Backtest::submitOrder("):
             return 7
         if "getOrders(engine, true)" in script or "getTrades(engine, true)" in script:
@@ -86,33 +69,34 @@ def messages(caplog, level: int) -> list[str]:
     return [record.getMessage() for record in caplog.records if record.levelno == level]
 
 
-def test_info_shows_first_moment_and_slow_initialization_only(session, monkeypatch, caplog):
-    clock = Clock()
-    monkeypatch.setattr(module, "perf_counter", clock)
+def test_info_reports_connection_engine_and_first_quote(session, caplog):
     caplog.set_level(logging.INFO, logger="backtest")
     probe = Probe(None)
-    replay(probe, Slow(clock))
+    replay(probe)
     assert probe.ready
     assert messages(caplog, logging.INFO) == [
-        "首个行情时点 2023-01-03 09:30:00，初始化 2 个 Algo",
-        "Slow 初始化完成，用时 2.50 秒",
+        "DolphinDB: localhost:8848",
+        "回测引擎 probe：2023-01-03 至 2023-01-04，Algo=Probe",
+        "首个行情时点 2023-01-03 09:30:00，初始化 1 个 Algo",
     ]
-    # 批次行数只在 DEBUG 时查询，默认级别不增加会话往返。
+    assert "secret" not in caplog.text
     assert not any(script.startswith("size(") for script in session.scripts)
 
 
-def test_debug_shows_engine_batches_and_replay_totals(session, caplog):
+def test_debug_reports_callbacks_batches_and_resource_cleanup(session, caplog):
     caplog.set_level(logging.DEBUG, logger="backtest")
     replay(Probe(None))
     debug = messages(caplog, logging.DEBUG)
-    assert debug[0] == "回测引擎 probe 已创建：2023-01-03 至 2023-01-04，Algo Probe"
-    assert debug[1] == "开始回放 2023-01-03 至 2023-01-04，每批 1 天"
-    assert debug[2].startswith("批次 2023-01-03：6 行行情、2 个时点，加载 ")
-    assert any(message.startswith("Probe 初始化完成，用时 ") for message in debug)
-    assert any(message.startswith("批次 2023-01-04：0 行行情、0 个时点") for message in debug)
-    assert debug[-3] == "发送 END 消息，完成日终与结束处理"
-    assert debug[-2].startswith("回放完成：2 个批次、2 个行情时点，用时 ")
-    assert debug[-1] == "释放回测引擎与会话"
+    assert "定义订单和成交回调：engine=probe" in debug
+    assert "创建回测引擎：probe" in debug
+    assert "批次 2023-01-03：2 个行情时点" in debug
+    assert "批次 2023-01-04：0 个行情时点" in debug
+    assert "初始化 Algo：Probe" in debug
+    assert debug[-3:] == [
+        "发送 END 消息，完成日终与结束处理",
+        "回放完成：2 个批次、2 个行情时点",
+        "释放回测引擎和连接",
+    ]
     assert "secret" not in caplog.text
 
 

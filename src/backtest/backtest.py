@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from time import perf_counter
 from types import TracebackType
 from typing import Any, Generic, Self, Sequence, TypeVar, final
 
@@ -110,10 +109,12 @@ class Backtest(ABC, Generic[C]):
         for algo in self.algos:
             algo.backtest = self
             algo.ctx = self.ctx
+        logger.info("DolphinDB: %s:%d", host, port)
         self.session = ddb.session()
         try:
             if not self.session.connect(host, port, username, password):
-                raise ConnectionError("DolphinDB connection failed")
+                raise ConnectionError(f"无法连接 DolphinDB {host}:{port}")
+            logger.debug("定义订单和成交回调：engine=%s", engine_name)
             self.session.run("""
                 def initialize(mutable ctx) {
                     ctx["orders"] = array(ANY, 0)
@@ -143,19 +144,16 @@ class Backtest(ABC, Generic[C]):
                 }
             """)
             self.session.upload({"engineName": engine_name, "config": self.config})
+            logger.debug("创建回测引擎：%s", engine_name)
             self.session.run("""
                 engine = Backtest::createBacktestEngine(engineName,config,,initialize,beforeTrading,,onSnapshot,onOrder,onTrade,afterTrading,finalize)
             """)
-        except Exception:
+        except BaseException:
             self.session.close()
             raise
-        logger.debug(
-            "回测引擎 %s 已创建：%s 至 %s，Algo %s",
-            engine_name,
-            self.config["startDate"],
-            self.config["endDate"],
-            " → ".join(type(algo).__name__ for algo in self.algos) or "无",
-        )
+        logger.info("回测引擎 %s：%s 至 %s，Algo=%s", engine_name,
+                    self.config["startDate"], self.config["endDate"],
+                    " -> ".join(type(algo).__name__ for algo in self.algos) or "无")
 
     @abstractmethod
     def load_messages(self, start: np.datetime64, end: np.datetime64) -> DosVar:
@@ -178,12 +176,10 @@ class Backtest(ABC, Generic[C]):
         start = np.datetime64(self.config["startDate"], "ms")
         end = np.datetime64(self.config["endDate"], "ms") + np.timedelta64(1, "D")
         last_time: np.datetime64 | None = None
-        started = perf_counter()
         batches = moments = 0
         logger.debug("开始回放 %s，每批 %s", _window(start, end), _span(batch_size))
         while start < end:
             batch_end = min(start + batch_size, end)
-            loading = perf_counter()
             message = self.load_messages(start, batch_end)
             timeline: np.ndarray = self.session.run(f"sort(distinct({message}.timestamp))")
             if len(timeline) and (timeline[0] < start or timeline[-1] >= batch_end):
@@ -191,9 +187,8 @@ class Backtest(ABC, Generic[C]):
             batches += 1
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "批次 %s：%d 行行情、%d 个时点，加载 %.2f 秒",
-                    _window(start, batch_end), self.session.run(f"size({message})"),
-                    len(timeline), perf_counter() - loading,
+                    "批次 %s：%d 个行情时点",
+                    _window(start, batch_end), len(timeline),
                 )
             start = batch_end
             if len(timeline) == 0:
@@ -213,21 +208,15 @@ class Backtest(ABC, Generic[C]):
             raise ValueError("行情为空")
         self.finish(DosVar("msg"))
         logger.debug(
-            "回放完成：%d 个批次、%d 个行情时点，用时 %.1f 秒", batches, moments, perf_counter() - started
+            "回放完成：%d 个批次、%d 个行情时点", batches, moments
         )
 
     @final
     def initialize(self) -> None:
         """按传入顺序初始化 Algo；run 在第一份行情进入插件前调用。"""
         for algo in self.algos:
-            started = perf_counter()
+            logger.debug("初始化 Algo：%s", type(algo).__name__)
             algo.initialize()
-            seconds = perf_counter() - started
-            # 训练、预加载等耗时初始化值得在默认级别显示，瞬时完成的只在调试时显示。
-            logger.log(
-                logging.INFO if seconds >= 1 else logging.DEBUG,
-                "%s 初始化完成，用时 %.2f 秒", type(algo).__name__, seconds,
-            )
 
     @final
     def on_snapshot(self, msg: DosVar) -> None:
@@ -421,7 +410,7 @@ class Backtest(ABC, Generic[C]):
 
     def close(self) -> None:
         """删除当前回测引擎，并在删除失败时仍关闭 SDK 会话。"""
-        logger.debug("释放回测引擎与会话")
+        logger.debug("释放回测引擎和连接")
         try:
             self.session.run("Backtest::dropBacktestEngine(engine)")
         finally:
@@ -437,5 +426,9 @@ class Backtest(ABC, Generic[C]):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """离开 with 块时释放引擎和会话，不自动执行 finish。"""
-        self.close()
+        """离开 with 块时释放资源，清理错误不覆盖原来的回测异常。"""
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
