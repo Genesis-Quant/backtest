@@ -1,8 +1,8 @@
 """真实插件撮合测试：仅上传人工五档盘口，不读取行情库。
 
-运行：uv run pytest tests/orders --ddb-config ../../arena/.env
-配置文件使用 DOLPHIN_HOST、DOLPHIN_PORT、DOLPHIN_RUNTIME_USERNAME、
-DOLPHIN_RUNTIME_PASSWORD；每个用例独立创建并释放引擎。
+运行：uv run pytest tests/orders --ddb-config ../.env
+配置文件只使用 DOLPHINDB_ENDPOINTS、DOLPHINDB_USERNAME、DOLPHINDB_PASSWORD，
+验证首个端点；每个用例独立创建并释放引擎。
 """
 
 from collections.abc import Iterator

@@ -20,9 +20,10 @@ def connection(pytestconfig: pytest.Config) -> tuple[str, int, str, str]:
         if "=" in line and not line.lstrip().startswith("#")
         for key, value in [line.split("=", 1)]
     }
+    host, port = values["DOLPHINDB_ENDPOINTS"].split(",")[0].strip().rsplit(":", 1)
     return (
-        values["DOLPHIN_HOST"],
-        int(values["DOLPHIN_PORT"]),
-        values["DOLPHIN_RUNTIME_USERNAME"],
-        values["DOLPHIN_RUNTIME_PASSWORD"],
+        host.removeprefix("[").removesuffix("]"),
+        int(port),
+        values["DOLPHINDB_USERNAME"],
+        values["DOLPHINDB_PASSWORD"],
     )

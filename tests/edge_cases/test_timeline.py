@@ -13,7 +13,7 @@ from backtest import Algo, DosVar
 def test_invalid_batch_size(make_engine: EngineFactory, span: np.timedelta64) -> None:
     algo = RecordingAlgo("selection")
     engine = make_engine([algo], None)
-    with pytest.raises(ValueError, match="batch_size 必须大于零"):
+    with pytest.raises(ValueError, match="行情加载跨度必须大于零"):
         engine.run(span)
     assert engine.ctx.events == []
     assert np.isnat(engine.time)
@@ -53,7 +53,7 @@ def test_loader_must_respect_half_open_batch(
     engine.session.run(f"update source set timestamp={outside}")
     # 故意返回查询范围外的数据，验证 Backtest 本身会阻止推进。
     monkeypatch.setattr(engine, "load_messages", lambda start, end: DosVar("source"))
-    with pytest.raises(ValueError, match=r"\[start, end\) 之外的行情"):
+    with pytest.raises(ValueError, match="行情超出本批日期范围"):
         engine.run()
     assert engine.ctx.events == []
     assert np.isnat(engine.time)
