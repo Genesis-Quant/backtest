@@ -130,11 +130,11 @@ class Backtest(ABC, Generic[C]):
                 raise ValueError("回测日期必须有效且开始日不晚于结束日")
             self.time = np.datetime64("NaT", "ms")
             self.moment = Moment(self.time, 0)
-            self._finishing = False
-            self._batch_log: BatchLog | None = None
-            self._batch_day = np.datetime64("NaT", "D")
-            self._batch_number = 0
-            self._printed_batch_time: np.datetime64 | None = None
+            self.finishing = False
+            self.batch_log: BatchLog | None = None
+            self.batch_day = np.datetime64("NaT", "D")
+            self.batch_number = 0
+            self.printed_batch_time: np.datetime64 | None = None
             self.ctx = ctx
             self.algos = tuple(algos)
             for algo in self.algos:
@@ -280,50 +280,50 @@ class Backtest(ABC, Generic[C]):
         finally:
             self.release(["inputTime", "msg", "endMsg"])
 
-    def _flush_batch_log(self, batch: BatchLog) -> None:
+    def flush_batch_log(self, batch: BatchLog) -> None:
         if not batch.changed:
             return
         day = np.datetime64(batch.time, "D")
-        if np.isnat(self._batch_day) or day != self._batch_day:
-            self._batch_day = day
-            self._batch_number = 0
-        self._batch_number += 1
-        self.emit_batch(replace(batch, sequence=self._batch_number))
+        if np.isnat(self.batch_day) or day != self.batch_day:
+            self.batch_day = day
+            self.batch_number = 0
+        self.batch_number += 1
+        self.emit_batch(replace(batch, sequence=self.batch_number))
         batch.orders = batch.cancellations = batch.order_reports = batch.trades = batch.rejected = 0
 
     @contextmanager
-    def _event_log(self, event: str):
-        previous = self._batch_log
+    def event_log(self, event: str):
+        previous = self.batch_log
         if previous is not None:
-            self._flush_batch_log(previous)
+            self.flush_batch_log(previous)
         batch = BatchLog(self.time, event)
-        self._batch_log = batch
+        self.batch_log = batch
         try:
             yield batch
         except BaseException:
             batch.failed = True
             raise
         finally:
-            self._batch_log = previous
-            self._flush_batch_log(batch)
+            self.batch_log = previous
+            self.flush_batch_log(batch)
 
     def emit_batch(self, batch: BatchLog) -> None:
         """有变动时先打印一次时间，同一时点的后续批次只打印批次信息。"""
         if not batch.changed:
             return
         moment = np.datetime64(batch.time, "ms")
-        previous = self._printed_batch_time
+        previous = self.printed_batch_time
         if previous is None or not (
             previous == moment or (np.isnat(previous) and np.isnat(moment))
         ):
             print(moment, flush=True)
-            self._printed_batch_time = moment
+            self.printed_batch_time = moment
         print(batch, flush=True)
 
-    def _record_operation(self, event: str, count: int) -> None:
-        batch = self._batch_log
+    def record_operation(self, event: str, count: int) -> None:
+        batch = self.batch_log
         if batch is None:
-            with self._event_log(event) as batch:
+            with self.event_log(event) as batch:
                 if event == "submit":
                     batch.orders += count
                 else:
@@ -335,7 +335,7 @@ class Backtest(ABC, Generic[C]):
 
     @final
     def initialize(self) -> None:
-        with self._event_log("initialize"):
+        with self.event_log("initialize"):
             for algo in self.algos:
                 algo.initialize()
 
@@ -376,7 +376,7 @@ class Backtest(ABC, Generic[C]):
         while True:
             kind, reports = self.next_events()
             if kind:
-                with self._event_log(kind) as batch:
+                with self.event_log(kind) as batch:
                     if kind == "order":
                         batch.order_reports = len(reports)
                         batch.rejected = sum(
@@ -394,7 +394,7 @@ class Backtest(ABC, Generic[C]):
                 return
             current = msg
             msg = None
-            with self._event_log("snapshot"):
+            with self.event_log("snapshot"):
                 self.on_snapshot(current)
 
     def snapshot_fields(self, msg: DosVar) -> dict[str, str]:
@@ -408,7 +408,7 @@ class Backtest(ABC, Generic[C]):
     def on_advance(self, snapshot: dict[str, Any]) -> None:
         """append 成功后调用；snapshot 只描述本次 RPC 返回瞬间的状态。"""
         self.moment = Moment(
-            np.datetime64("NaT", "ms") if self._finishing else self.time,
+            np.datetime64("NaT", "ms") if self.finishing else self.time,
             int(snapshot["quotes"]),
         )
 
@@ -424,7 +424,7 @@ class Backtest(ABC, Generic[C]):
             millis = int(np.datetime64(self.time, "ms").astype(np.int64))
             selection = f"{msg} = select * from {source} where timestamp = timestamp({millis}l);"
             if getattr(self.advance, "__func__", None) is Backtest.advance:
-                self._advance(msg, selection)
+                self.advance_message(msg, selection)
             else:
                 self.session.run(f"{selection}\nNULL")
                 self.advance(msg)
@@ -432,9 +432,9 @@ class Backtest(ABC, Generic[C]):
 
     def advance(self, msg: DosVar) -> None:
         """推进已备好的 msg，不消费回报；保留子类的 advance(msg) hook。"""
-        self._advance(msg)
+        self.advance_message(msg)
 
-    def _advance(self, msg: DosVar, selection: str = "") -> None:
+    def advance_message(self, msg: DosVar, selection: str = "") -> None:
         """一次 RPC 完成可选行情选择、状态检查、append 和瞬时扩展快照。"""
         extra = self.snapshot_fields(msg)
         if {"quotes", "eventsEmpty"} & extra.keys():
@@ -454,7 +454,7 @@ class Backtest(ABC, Generic[C]):
 
     def submit_order(self, order: Order) -> int:
         """同步提交单笔委托；直接进入运输层，不反向调用公开批量 hook。"""
-        return self._submit_orders([order])[0]
+        return self.send_orders([order])[0]
 
     def submit_orders(self, orders: Sequence[Order]) -> list[int]:
         """按输入顺序同步提交，默认一次 RPC，不交错分发回报。
@@ -464,12 +464,12 @@ class Backtest(ABC, Generic[C]):
         """
         submit = self.submit_order
         if getattr(submit, "__func__", None) is not Backtest.submit_order:
-            scope = self._event_log("submit") if self._batch_log is None else nullcontext()
+            scope = self.event_log("submit") if self.batch_log is None else nullcontext()
             with scope:
                 return [submit(order) for order in orders]
-        return self._submit_orders(orders)
+        return self.send_orders(orders)
 
-    def _submit_orders(self, orders: Sequence[Order]) -> list[int]:
+    def send_orders(self, orders: Sequence[Order]) -> list[int]:
         """一次 RPC 按序运输委托并返回真实编号；不调用公开下单 hook。"""
         if not orders:
             return []
@@ -488,7 +488,7 @@ class Backtest(ABC, Generic[C]):
         )
         identifiers = [int(identifier) for identifier in result["ids"]]
         self.moment.orders += len(identifiers)
-        self._record_operation("submit", len(identifiers))
+        self.record_operation("submit", len(identifiers))
         return identifiers
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:
@@ -510,7 +510,7 @@ class Backtest(ABC, Generic[C]):
             np.asarray(orders if orders is not None else [], dtype=np.int64),
             label,
         )
-        self._record_operation("cancel", 1)
+        self.record_operation("cancel", 1)
 
     def get_records(self, expression: str, model: type[T]) -> list[T]:
         columns = self.session.run(
@@ -555,7 +555,7 @@ class Backtest(ABC, Generic[C]):
         )
 
     def finish(self, msg: DosVar) -> None:
-        self._finishing = True
+        self.finishing = True
         try:
             self.session.run(f"""
                 endMsg = select top 1 * from {msg}
@@ -565,7 +565,7 @@ class Backtest(ABC, Generic[C]):
             self.advance(DosVar("endMsg"))
             self.process_events()
         finally:
-            self._finishing = False
+            self.finishing = False
             self.release(["endMsg"])
 
     def close(self) -> None:
