@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Any, Generic, Self, Sequence, TypeVar, final
+from typing import Any, Generic, Literal, Self, Sequence, TypeVar, final
 
 import dolphindb as ddb
 import numpy as np
@@ -26,14 +28,23 @@ from .models import (
 from .orders import Order
 from .types import DosRecord, DosVar
 
-__all__ = ["Backtest"]
+__all__ = ["Backtest", "EventBatch"]
 
 C = TypeVar("C", bound=BaseModel, infer_variance=True)
 T = TypeVar("T", bound=DosRecord, infer_variance=True)
 
 
+@dataclass(frozen=True, slots=True)
+class EventBatch:
+    """已同步消费的单个回报队列；空状态仅代表本次 RPC 返回瞬间，不是缓存。"""
+
+    kind: Literal["", "order", "trade"]
+    reports: list[OrderReport] | list[TradeReport]
+    events_empty: bool
+
+
 class Moment:
-    """一个行情时点的回放情况；该时点的成交要等时间线推进后才完整，因此推进后再输出。"""
+    """当前行情时点的累计统计；日志按有操作或回报的事件批次输出。"""
 
     def __init__(self, time: np.datetime64, quotes: int) -> None:
         self.time = time
@@ -46,6 +57,39 @@ class Moment:
         return (
             f"行情时点 {self.time}：报价 {self.quotes}，委托 {self.orders}，"
             f"成交 {self.trades}，拒单 {self.rejected}"
+        )
+
+
+@dataclass(slots=True)
+class BatchLog:
+    time: np.datetime64
+    event: str
+    sequence: int = 0
+    orders: int = 0
+    cancellations: int = 0
+    order_reports: int = 0
+    trades: int = 0
+    rejected: int = 0
+    failed: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.orders or self.cancellations or self.order_reports or self.trades)
+
+    def __str__(self) -> str:
+        labels = {
+            "initialize": "初始化",
+            "snapshot": "行情回调",
+            "order": "委托回调",
+            "trade": "成交回调",
+            "submit": "批量委托",
+            "cancel": "撤单",
+        }
+        return (
+            f"{self.time} 批次 {self.sequence} [{labels[self.event]}]："
+            f"提交 {self.orders}，撤单请求 {self.cancellations}，"
+            f"委托回报 {self.order_reports}，成交 {self.trades}，拒单 {self.rejected}"
+            + ("；处理失败" if self.failed else "")
         )
 
 
@@ -86,14 +130,10 @@ class Backtest(ABC, Generic[C]):
                 raise ValueError("回测日期必须有效且开始日不晚于结束日")
             self.time = np.datetime64("NaT", "ms")
             self.moment = Moment(self.time, 0)
-            self.trusted_event_cache = False
-            self.deferred_trade_ack = False
-            self._events_empty: bool | None = None
-            self._prefetched_trades: tuple[int, list[Any]] | None = None
-            self._pending_trade_ack: int | None = None
-            self._event_rpc_active = False
-            self._message_source: DosVar | None = None
             self._finishing = False
+            self._batch_log: BatchLog | None = None
+            self._batch_day = np.datetime64("NaT", "D")
+            self._batch_number = 0
             self.ctx = ctx
             self.algos = tuple(algos)
             for algo in self.algos:
@@ -106,9 +146,6 @@ class Backtest(ABC, Generic[C]):
                 def initialize(mutable ctx) {
                     ctx["orders"] = array(ANY, 0)
                     ctx["trades"] = array(ANY, 0)
-                    ctx["tradeReadVersion"] = 0l
-                    ctx["tradePeekVersion"] = 0l
-                    ctx["tradePeek"] = array(ANY, 0)
                 }
                 def beforeTrading(mutable ctx) {}
                 def afterTrading(mutable ctx) {}
@@ -129,45 +166,15 @@ class Backtest(ABC, Generic[C]):
                 def getTrades(engine, clear=false) {
                     ctx = Backtest::getContextDict(engine)
                     trades = ctx["trades"]
-                    if (clear) {
-                        ctx["trades"] = array(ANY, 0)
-                        ctx["tradeReadVersion"] += 1
-                    }
+                    if (clear) ctx["trades"] = array(ANY, 0)
                     return trades
-                }
-                def soloAckTrades(engine, version) {
-                    if (version < 0) return
-                    ctx = Backtest::getContextDict(engine)
-                    expected = ctx["tradePeek"]
-                    trades = ctx["trades"]
-                    count = size(expected)
-                    if (version != ctx["tradePeekVersion"] ||
-                        ctx["tradeReadVersion"] != ctx["tradePeekReadVersion"] ||
-                        count == 0 || size(trades) < count)
-                        throw "递延成交确认已失效，回报未被清除"
-                    for (i in 0:count) {
-                        if (!eqObj(expected[i].keys(), trades[i].keys()))
-                            throw "递延成交确认内容不匹配，回报未被清除"
-                        for (key in expected[i].keys()) {
-                            if (!eqObj(expected[i][key], trades[i][key]))
-                                throw "递延成交确认内容不匹配，回报未被清除"
-                        }
-                    }
-                    ctx["trades"] = trades[count:size(trades)]
-                    ctx["tradeReadVersion"] += 1
-                    ctx["tradePeek"] = array(ANY, 0)
-                }
-                def soloFlushTrades(engineName, version) {
-                    soloAckTrades(objByName(engineName), version)
-                    NULL
                 }
                 def soloEventsEmpty(engine) {
                     ctx = Backtest::getContextDict(engine)
                     return size(ctx["orders"]) == 0 && size(ctx["trades"]) == 0
                 }
-                def soloNextEvents(engineName, ackVersion, prefetch) {
+                def soloNextEvents(engineName) {
                     engine = objByName(engineName)
-                    soloAckTrades(engine, ackVersion)
                     ctx = Backtest::getContextDict(engine)
                     kind = ""
                     reports = array(ANY, 0)
@@ -178,21 +185,11 @@ class Backtest(ABC, Generic[C]):
                         kind = "trade"
                         reports = getTrades(engine, true)
                     }
-                    peek = array(ANY, 0)
-                    version = -1l
-                    if (prefetch && kind == "order" && size(ctx["trades"])) {
-                        peek = getTrades(engine)
-                        ctx["tradePeek"] = each(copy, peek)
-                        ctx["tradePeekVersion"] += 1
-                        ctx["tradePeekReadVersion"] = ctx["tradeReadVersion"]
-                        version = ctx["tradePeekVersion"]
-                    }
-                    return dict(`kind`reports`eventsEmpty`peekTrades`peekVersion,
-                        [kind, reports, soloEventsEmpty(engine), peek, version])
+                    return dict(`kind`reports`eventsEmpty,
+                        [kind, reports, soloEventsEmpty(engine)])
                 }
-                def soloSubmitOrders(engineName, messages, labels, kinds, settings, hasSettings, ackVersion) {
+                def soloSubmitOrders(engineName, messages, labels, kinds, settings, hasSettings) {
                     engine = objByName(engineName)
-                    soloAckTrades(engine, ackVersion)
                     identifiers = array(LONG, 0)
                     for (i in 0:size(messages)) {
                         if (!hasSettings[i]) {
@@ -207,9 +204,8 @@ class Backtest(ABC, Generic[C]):
                     }
                     return dict(`ids`eventsEmpty, [identifiers, soloEventsEmpty(engine)])
                 }
-                def soloCancelOrder(engineName, symbol, identifiers, label, ackVersion) {
+                def soloCancelOrder(engineName, symbol, identifiers, label) {
                     engine = objByName(engineName)
-                    soloAckTrades(engine, ackVersion)
                     Backtest::cancelOrder(engine, symbol, identifiers, label)
                     return soloEventsEmpty(engine)
                 }
@@ -275,12 +271,7 @@ class Backtest(ABC, Generic[C]):
                     if not initialized:
                         self.initialize()
                         initialized = True
-                    self._message_source = message
-                    try:
-                        self.advance(DosVar("msg"))
-                    finally:
-                        self._message_source = None
-                    self.process_events(DosVar("msg"))
+                    self.step(DosVar("msg"), source=message)
                 start = batch_end
             if not initialized:
                 raise ValueError("行情为空")
@@ -288,10 +279,55 @@ class Backtest(ABC, Generic[C]):
         finally:
             self.release(["inputTime", "msg", "endMsg"])
 
+    def _flush_batch_log(self, batch: BatchLog) -> None:
+        if not batch.changed:
+            return
+        day = np.datetime64(batch.time, "D")
+        if np.isnat(self._batch_day) or day != self._batch_day:
+            self._batch_day = day
+            self._batch_number = 0
+        self._batch_number += 1
+        self.emit_batch(replace(batch, sequence=self._batch_number))
+        batch.orders = batch.cancellations = batch.order_reports = batch.trades = batch.rejected = 0
+
+    @contextmanager
+    def _event_log(self, event: str):
+        previous = self._batch_log
+        if previous is not None:
+            self._flush_batch_log(previous)
+        batch = BatchLog(self.time, event)
+        self._batch_log = batch
+        try:
+            yield batch
+        except BaseException:
+            batch.failed = True
+            raise
+        finally:
+            self._batch_log = previous
+            self._flush_batch_log(batch)
+
+    def emit_batch(self, batch: BatchLog) -> None:
+        """一批 Python 回调及其新增操作完成后打印；没有变动的批次不输出。"""
+        print(batch, flush=True)
+
+    def _record_operation(self, event: str, count: int) -> None:
+        batch = self._batch_log
+        if batch is None:
+            with self._event_log(event) as batch:
+                if event == "submit":
+                    batch.orders += count
+                else:
+                    batch.cancellations += count
+        elif event == "submit":
+            batch.orders += count
+        else:
+            batch.cancellations += count
+
     @final
     def initialize(self) -> None:
-        for algo in self.algos:
-            algo.initialize()
+        with self._event_log("initialize"):
+            for algo in self.algos:
+                algo.initialize()
 
     @final
     def on_snapshot(self, msg: DosVar) -> None:
@@ -309,123 +345,93 @@ class Backtest(ABC, Generic[C]):
         for algo in reversed(self.algos):
             getattr(algo, callback)(payload)
 
-    def invalidate_events(self) -> None:
-        """原始 session 调用可能改变插件回报时，使空提示和未消费的预取失效。"""
-        self._events_empty = None
-        self._prefetched_trades = None
-
-    def flush_pending_events(self, session: Any | None = None) -> None:
-        """原始 session 读写前确认已交付成交；代理应传入未包装的 session。"""
-        if self._event_rpc_active or self._pending_trade_ack is None:
-            return
-        runner = self.session if session is None else session
-        self._run_event_rpc("soloFlushTrades", "engine", self._ack_version(), session=runner)
-
-    def _ack_version(self) -> np.int64:
-        return np.int64(-1 if self._pending_trade_ack is None else self._pending_trade_ack)
-
-    def _run_event_rpc(self, script: str, *args: Any, session: Any | None = None) -> Any:
-        """已携带待确认版本的 RPC；防止 session 代理重复确认或递归。"""
-        self.invalidate_events()
-        self._event_rpc_active = True
-        try:
-            result = (self.session if session is None else session).run(script, *args)
-        except BaseException:
-            # ACK 可能已执行；不重试具有交易副作用的 RPC。
-            raise
-        else:
-            self._pending_trade_ack = None
-            return result
-        finally:
-            self._event_rpc_active = False
-
-    def next_events(self) -> tuple[str, list[OrderReport] | list[TradeReport]]:
-        """仅消费一个非空回报队列，始终先委托后成交；回调前已逻辑清空。"""
-        if self.trusted_event_cache:
-            if self._prefetched_trades is not None:
-                version, records = self._prefetched_trades
-                reports = [TradeReport.model_validate(record) for record in records]
-                self._prefetched_trades = None
-                self._pending_trade_ack = version
-                self._events_empty = True
-                return "trade", reports
-            if self._events_empty is True:
-                return "", []
-        result = self._run_event_rpc(
-            "soloNextEvents",
-            "engine",
-            self._ack_version(),
-            self.deferred_trade_ack and self.trusted_event_cache,
-        )
-        self._events_empty = bool(result["eventsEmpty"])
-        if len(result["peekTrades"]):
-            self._prefetched_trades = (int(result["peekVersion"]), list(result["peekTrades"]))
+    def next_event_batch(self) -> EventBatch:
+        """实时读取并同步清空一个队列，orders 优先；不预取、不延迟确认。"""
+        result = self.session.run("soloNextEvents", "engine")
         kind = result["kind"] or ""
         model = OrderReport if kind == "order" else TradeReport
-        return kind, [model.model_validate(record) for record in result["reports"]]
+        return EventBatch(
+            kind,
+            [model.model_validate(record) for record in result["reports"]],
+            bool(result["eventsEmpty"]),
+        )
+
+    def next_events(self) -> tuple[str, list[OrderReport] | list[TradeReport]]:
+        """兼容二元组接口；每次都查询服务端，不依赖前一次返回的空状态。"""
+        batch = self.next_event_batch()
+        return batch.kind, batch.reports
 
     def process_events(self, msg: DosVar | None = None) -> None:
-        # 默认不信任其他调用者是否通过原始 session 修改了插件。
-        if not self.trusted_event_cache:
-            self.invalidate_events()
+        """排空回报后分发行情，再排空回调产生的回报；允许回调内重入。"""
         while True:
             kind, reports = self.next_events()
             if kind:
-                try:
+                with self._event_log(kind) as batch:
                     if kind == "order":
-                        self.moment.rejected += sum(
+                        batch.order_reports = len(reports)
+                        batch.rejected = sum(
                             report.status == OrderStatus.REJECTED for report in reports
                         )
+                        self.moment.rejected += batch.rejected
                         self.on_order(reports)
                     else:
-                        self.moment.trades += len(reports)
+                        batch.trades = len(reports)
+                        self.moment.trades += batch.trades
                         self.on_trade(reports)
-                finally:
-                    if not self.trusted_event_cache:
-                        self.invalidate_events()
+                # 任意 Python 回调都可能直接调用 session；必须重新查询队列。
                 continue
             if msg is None:
                 return
             current = msg
             msg = None
-            try:
+            with self._event_log("snapshot"):
                 self.on_snapshot(current)
-            finally:
-                if not self.trusted_event_cache:
-                    self.invalidate_events()
 
     def snapshot_fields(self, msg: DosVar) -> dict[str, str]:
-        """扩展一步回放的返回值：字段名映射为 append 之后执行的 DOS 表达式。"""
+        """扩展 append 后的瞬时返回值，不由内核缓存或自动用于账户查询。
+
+        字段名映射为 DOS 表达式；任何后续 session 操作、下单、回调或推进均
+        可能使值过时。扩展自行持有的副本不具备跨这些边界的实时性保证。
+        """
         return {}
 
     def on_advance(self, snapshot: dict[str, Any]) -> None:
-        """append 成功后调用；可缓存 snapshot_fields 返回的价格或账户快照。"""
-        if not np.isnat(self.moment.time):
-            self.emit_moment(self.moment)
+        """append 成功后调用；snapshot 只描述本次 RPC 返回瞬间的状态。"""
         self.moment = Moment(
             np.datetime64("NaT", "ms") if self._finishing else self.time,
             int(snapshot["quotes"]),
         )
 
-    def emit_moment(self, moment: Moment) -> None:
-        """仅在后继行情成功推进后输出一次；上层可覆盖为统一封存输出。"""
-        print(moment, flush=True)
+    def step(self, msg: DosVar, *, source: DosVar | None = None) -> None:
+        """推进并分发一个时点；source 非空时按 self.time 选择本批行情。
+
+        默认实现融合选择和 append；旧 advance(msg) 覆写仍按原签名调用，
+        该兼容路径先单独选取行情，不要求子类接收新增关键字参数。
+        """
+        if source is None:
+            self.advance(msg)
+        else:
+            millis = int(np.datetime64(self.time, "ms").astype(np.int64))
+            selection = f"{msg} = select * from {source} where timestamp = timestamp({millis}l);"
+            if getattr(self.advance, "__func__", None) is Backtest.advance:
+                self._advance(msg, selection)
+            else:
+                self.session.run(f"{selection}\nNULL")
+                self.advance(msg)
+        self.process_events(msg)
 
     def advance(self, msg: DosVar) -> None:
-        selection = ""
-        if self._message_source is not None:
-            millis = int(np.datetime64(self.time, "ms").astype(np.int64))
-            selection = (
-                f"{msg} = select * from {self._message_source} "
-                f"where timestamp = timestamp({millis}l);"
-            )
+        """推进已备好的 msg，不消费回报；保留子类的 advance(msg) hook。"""
+        self._advance(msg)
+
+    def _advance(self, msg: DosVar, selection: str = "") -> None:
+        """一次 RPC 完成可选行情选择、状态检查、append 和瞬时扩展快照。"""
         extra = self.snapshot_fields(msg)
         if {"quotes", "eventsEmpty"} & extra.keys():
             raise ValueError("回放快照扩展字段不能覆盖 quotes 或 eventsEmpty")
         names = ["quotes", "eventsEmpty", *extra]
         expressions = [f"{msg}.rows()", "soloEventsEmpty(engine)", *extra.values()]
-        snapshot = self._run_event_rpc(f"""
-            soloAckTrades(engine, {int(self._ack_version())}l)
+        snapshot = self.session.run(f"""
             {selection}
             (def(engine, message) {{
                 stat = Backtest::getBacktestEngineStat(engine)
@@ -434,22 +440,34 @@ class Backtest(ABC, Generic[C]):
             }})(engine, {msg})
             dict({json.dumps(names)}, [{", ".join(f"({expression})" for expression in expressions)}])
         """)
-        self._events_empty = bool(snapshot["eventsEmpty"])
         self.on_advance(snapshot)
 
     def submit_order(self, order: Order) -> int:
-        """同步提交单笔委托并返回真实插件编号，不延迟下单。"""
-        return self.submit_orders([order])[0]
+        """同步提交单笔委托；直接进入运输层，不反向调用公开批量 hook。"""
+        return self._submit_orders([order])[0]
 
     def submit_orders(self, orders: Sequence[Order]) -> list[int]:
-        """一次往返按输入顺序逐笔调用插件，不重排、不交错分发回报。"""
+        """按输入顺序同步提交，默认一次 RPC，不交错分发回报。
+
+        子类若覆写 submit_order，则逐笔调用该 hook，保留其价格或风控逻辑；
+        hook 内可安全调用 super().submit_order，不会递归进入本批量接口。
+        """
+        submit = self.submit_order
+        if getattr(submit, "__func__", None) is not Backtest.submit_order:
+            scope = self._event_log("submit") if self._batch_log is None else nullcontext()
+            with scope:
+                return [submit(order) for order in orders]
+        return self._submit_orders(orders)
+
+    def _submit_orders(self, orders: Sequence[Order]) -> list[int]:
+        """一次 RPC 按序运输委托并返回真实编号；不调用公开下单 hook。"""
         if not orders:
             return []
         messages = [order.to_dos() for order in orders]
         labels = np.asarray([order.label for order in orders], dtype=str)
         kinds = np.asarray([order.kind for order in orders], dtype=np.int32)
         settings = [order.algo_params() for order in orders]
-        result = self._run_event_rpc(
+        result = self.session.run(
             "soloSubmitOrders",
             "engine",
             messages,
@@ -457,16 +475,14 @@ class Backtest(ABC, Generic[C]):
             kinds,
             settings,
             np.asarray([item is not None for item in settings], dtype=bool),
-            self._ack_version(),
         )
         identifiers = [int(identifier) for identifier in result["ids"]]
-        self._events_empty = bool(result["eventsEmpty"])
         self.moment.orders += len(identifiers)
+        self._record_operation("submit", len(identifiers))
         return identifiers
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:
-        self._run_event_rpc(f"""
-            soloAckTrades(engine, {int(self._ack_version())}l)
+        self.session.run(f"""
             Backtest::setTradingVolumeDist(engine, {volume})
             NULL
         """)
@@ -477,20 +493,17 @@ class Backtest(ABC, Generic[C]):
         orders: Sequence[int] | None = None,
         label: str = "",
     ) -> None:
-        self._events_empty = bool(
-            self._run_event_rpc(
-                "soloCancelOrder",
-                "engine",
-                symbol,
-                np.asarray(orders if orders is not None else [], dtype=np.int64),
-                label,
-                self._ack_version(),
-            )
+        self.session.run(
+            "soloCancelOrder",
+            "engine",
+            symbol,
+            np.asarray(orders if orders is not None else [], dtype=np.int64),
+            label,
         )
+        self._record_operation("cancel", 1)
 
     def get_records(self, expression: str, model: type[T]) -> list[T]:
-        columns = self._run_event_rpc(
-            f"soloAckTrades(engine, {int(self._ack_version())}l); "
+        columns = self.session.run(
             f"(def(records) {{ return dict(records.columnNames(), records.values()) }})({expression})"
         )
         return [
@@ -504,23 +517,18 @@ class Backtest(ABC, Generic[C]):
             for position in self.get_records("Backtest::getPosition(engine)", Position)
         }
 
-    def _read_events(self, expression: str) -> Any:
-        return self._run_event_rpc(
-            f"soloAckTrades(engine, {int(self._ack_version())}l); {expression}"
-        )
-
     def get_orders(self) -> list[OrderReport]:
         return [
-            OrderReport.model_validate(record) for record in self._read_events("getOrders(engine)")
+            OrderReport.model_validate(record) for record in self.session.run("getOrders(engine)")
         ]
 
     def get_trades(self) -> list[TradeReport]:
         return [
-            TradeReport.model_validate(record) for record in self._read_events("getTrades(engine)")
+            TradeReport.model_validate(record) for record in self.session.run("getTrades(engine)")
         ]
 
     def get_context(self) -> EngineContext:
-        return EngineContext.model_validate(self._read_events("Backtest::getContextDict(engine)"))
+        return EngineContext.model_validate(self.session.run("Backtest::getContextDict(engine)"))
 
     def get_trade_details(self) -> list[TradeDetail]:
         return self.get_records("Backtest::getTradeDetails(engine)", TradeDetail)
@@ -539,8 +547,7 @@ class Backtest(ABC, Generic[C]):
     def finish(self, msg: DosVar) -> None:
         self._finishing = True
         try:
-            self._run_event_rpc(f"""
-                soloAckTrades(engine, {int(self._ack_version())}l)
+            self.session.run(f"""
                 endMsg = select top 1 * from {msg}
                 update endMsg set symbol = "END", timestamp = timestamp + 1
                 NULL
@@ -555,8 +562,7 @@ class Backtest(ABC, Generic[C]):
         if self.closed:
             return
         try:
-            self._run_event_rpc(f"""
-                soloAckTrades(engine, {int(self._ack_version())}l)
+            self.session.run("""
                 Backtest::dropBacktestEngine(engine)
                 NULL
             """)

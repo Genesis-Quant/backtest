@@ -1,5 +1,5 @@
 from .algo import Algo
-from .backtest import Backtest
+from .backtest import Backtest, EventBatch
 from .enums import (
     AlgoPriceType,
     Direction,
@@ -40,6 +40,7 @@ __all__ = [
     "DosRecord",
     "DosVar",
     "EngineContext",
+    "EventBatch",
     "LimitOrder",
     "MarketOrder",
     "Order",
