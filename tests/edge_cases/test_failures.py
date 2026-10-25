@@ -55,12 +55,7 @@ def test_close_still_disconnects_when_engine_drop_fails(monkeypatch: pytest.Monk
     session.run.side_effect = RuntimeError("drop failed")
     with pytest.raises(RuntimeError, match="drop failed"):
         engine.close()
-    script = session.run.call_args.args[0]
-    assert (
-        script.index("[DOS 回测] 开始回收引擎")
-        < script.index("Backtest::dropBacktestEngine(engine)")
-        < script.index("[DOS 回测] 引擎已回收")
-    )
+    assert "Backtest::dropBacktestEngine(engine)" in session.run.call_args.args[0]
     session.close.assert_called_once_with()
 
 
@@ -81,12 +76,7 @@ def test_context_manager_preserves_body_exception_and_closes(
             ctx=SharedContext(),
         ):
             raise ValueError("research failed")
-    script = session.run.call_args.args[0]
-    assert (
-        script.index("[DOS 回测] 开始回收引擎")
-        < script.index("Backtest::dropBacktestEngine(engine)")
-        < script.index("[DOS 回测] 引擎已回收")
-    )
+    assert "Backtest::dropBacktestEngine(engine)" in session.run.call_args.args[0]
     session.close.assert_called_once_with()
 
 

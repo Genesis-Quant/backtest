@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from abc import ABC, abstractmethod
 from types import TracebackType
 from typing import Any, Generic, Self, Sequence, TypeVar, final
@@ -30,7 +29,19 @@ __all__ = ["Backtest"]
 
 C = TypeVar("C", bound=BaseModel, infer_variance=True)
 T = TypeVar("T", bound=DosRecord, infer_variance=True)
-logger = logging.getLogger("backtest")
+
+
+class Moment:
+    """一个行情时点的回放情况；该时点的成交要等时间线推进后才完整，因此推进后再输出。"""
+
+    def __init__(self, time: np.datetime64, quotes: int) -> None:
+        self.time = time
+        self.quotes = quotes
+        self.orders = 0
+        self.trades = 0
+
+    def __str__(self) -> str:
+        return f"行情时点 {self.time}：报价 {self.quotes}，委托 {self.orders}，成交 {self.trades}"
 
 
 class Backtest(ABC, Generic[C]):
@@ -69,17 +80,16 @@ class Backtest(ABC, Generic[C]):
             ):
                 raise ValueError("回测日期必须有效且开始日不晚于结束日")
             self.time = np.datetime64("NaT", "ms")
+            self.moment = Moment(self.time, 0)
             self.ctx = ctx
             self.algos = tuple(algos)
             for algo in self.algos:
                 algo.backtest = self
                 algo.ctx = self.ctx
             if session is None:
-                logger.info(f"DolphinDB: {host}:{port}")
                 if not self.session.connect(host, port, username, password):
                     raise ConnectionError(f"无法连接 DolphinDB {host}:{port}")
             self.session.run("""
-                print("[DOS 回测] 开始定义订单和成交回调")
                 def initialize(mutable ctx) {
                     ctx["orders"] = array(ANY, 0)
                     ctx["trades"] = array(ANY, 0)
@@ -106,14 +116,11 @@ class Backtest(ABC, Generic[C]):
                     if (clear) ctx["trades"] = array(ANY, 0)
                     return trades
                 }
-                print("[DOS 回测] 订单和成交回调已定义")
                 NULL
             """)
-            self.upload({"engineName": engine_name, "config": self.config}, "回测引擎配置")
+            self.session.upload({"engineName": engine_name, "config": self.config})
             self.session.run("""
-                print("[DOS 回测] 开始创建引擎：" + engineName)
                 engine = Backtest::createBacktestEngine(engineName, config,, initialize, beforeTrading,, onSnapshot, onOrder, onTrade, afterTrading, finalize)
-                print("[DOS 回测] 引擎已创建：" + engineName)
                 NULL
             """)
             created = True
@@ -125,21 +132,9 @@ class Backtest(ABC, Generic[C]):
                 else:
                     self.session.close()
                     self.closed = True
-            except Exception as error:
-                logger.warning(f"回测初始化失败后资源回收异常：{type(error).__name__}")
+            except Exception:
+                pass
             raise
-        logger.info(
-            f"回测引擎 {engine_name}：{self.config['startDate']} 至 {self.config['endDate']}"
-        )
-
-    def upload(self, variables: dict[str, Any], label: str) -> None:
-        """数据交互入口，使用方可覆盖此方法接入自己的日志。"""
-        logger.debug(f"上传：{label}")
-        self.session.upload(variables)
-
-    def download(self, expression: str, label: str) -> Any:
-        logger.debug(f"读取：{label}")
-        return self.session.run(expression)
 
     def release(self, variables: Sequence[str]) -> None:
         if not variables:
@@ -150,8 +145,8 @@ class Backtest(ABC, Generic[C]):
         ]
         try:
             self.session.run("\n".join([*statements, "NULL"]))
-        except Exception as error:
-            logger.warning(f"临时数据回收失败：{type(error).__name__}")
+        except Exception:
+            pass
 
     @abstractmethod
     def load_messages(self, start: np.datetime64, end: np.datetime64) -> DosVar:
@@ -168,14 +163,14 @@ class Backtest(ABC, Generic[C]):
             while start < end:
                 batch_end = min(start + batch_size, end)
                 message = self.load_messages(start, batch_end)
-                timeline = self.download(f"sort(distinct({message}.timestamp))", "本批行情时点")
+                timeline = self.session.run(f"sort(distinct({message}.timestamp))")
                 if len(timeline) and (timeline[0] < start or timeline[-1] >= batch_end):
                     raise ValueError("行情超出本批日期范围")
                 for self.time in timeline:
                     if not initialized:
                         self.initialize()
                         initialized = True
-                    self.upload({"inputTime": self.time}, "当前行情时点")
+                    self.session.upload({"inputTime": self.time})
                     self.session.run(
                         f"msg = select * from {message} where timestamp = inputTime; NULL"
                     )
@@ -211,12 +206,13 @@ class Backtest(ABC, Generic[C]):
 
     def process_events(self, msg: DosVar | None = None) -> None:
         while True:
-            orders = self.download("getOrders(engine, true)", "订单回报")
+            orders = self.session.run("getOrders(engine, true)")
             if len(orders):
                 self.on_order([OrderReport.model_validate(record) for record in orders])
                 continue
-            trades = self.download("getTrades(engine, true)", "成交回报")
+            trades = self.session.run("getTrades(engine, true)")
             if len(trades):
+                self.moment.trades += len(trades)
                 self.on_trade([TradeReport.model_validate(record) for record in trades])
                 continue
             if msg is None:
@@ -226,60 +222,49 @@ class Backtest(ABC, Generic[C]):
             self.on_snapshot(current)
 
     def advance(self, msg: DosVar) -> None:
-        self.session.run(f"""
+        quotes = self.session.run(f"""
             (def(engine, message) {{
-                stage = iif(message.symbol[0] == "END", "[DOS 回测] 结束回测", "[DOS 行情] 追加行情")
-                print(stage + "开始：" + string(message.timestamp[0]) + "，报价数=" + string(message.rows()))
                 stat = Backtest::getBacktestEngineStat(engine)
                 if (stat.status[0] == "FATAL") throw "回测引擎发生错误：" + stat.lastErrMsg[0]
                 Backtest::appendQuotationMsg(engine, message)
-                print(stage + "完成：" + string(message.timestamp[0]))
-                return NULL
+                return message.rows()
             }})(engine, {msg})
         """)
+        if not np.isnat(self.moment.time):
+            print(self.moment, flush=True)
+        self.moment = Moment(self.time, int(quotes))
 
     def submit_order(self, order: Order) -> int:
         try:
-            self.upload(
+            self.session.upload(
                 {
                     "orderMsg": order.to_dos(),
                     "orderKind": np.int32(order.kind),
                     "orderLabel": order.label,
-                },
-                "委托参数",
+                }
             )
             parameters = order.algo_params()
             if parameters is not None:
-                self.upload({"algoOrderParam": parameters}, "算法委托参数")
+                self.session.upload({"algoOrderParam": parameters})
                 expression = """
                     (def(engine, message, label, kind, settings) {
                         params = copy(settings)
                         params["endTime"] = second(params["endTime"])
                         if ("startTime" in params.keys()) params["startTime"] = second(params["startTime"])
-                        print("[DOS 委托] 开始提交算法委托，类型=" + string(kind))
-                        orderId = Backtest::submitOrder(engine, message, label, kind,, params)[0]
-                        print("[DOS 委托] 算法委托已提交，编号=" + string(orderId))
-                        return orderId
+                        return Backtest::submitOrder(engine, message, label, kind,, params)[0]
                     })(engine, orderMsg, orderLabel, orderKind, algoOrderParam)
                 """
             else:
-                expression = """
-                    (def(engine, message, label, kind) {
-                        print("[DOS 委托] 开始提交委托，类型=" + string(kind))
-                        orderId = Backtest::submitOrder(engine, message, label, kind)[0]
-                        print("[DOS 委托] 委托已提交，编号=" + string(orderId))
-                        return orderId
-                    })(engine, orderMsg, orderLabel, orderKind)
-                """
-            return int(self.download(expression, "委托编号"))
+                expression = "Backtest::submitOrder(engine, orderMsg, orderLabel, orderKind)[0]"
+            identifier = int(self.session.run(expression))
         finally:
             self.release(["orderMsg", "orderKind", "orderLabel", "algoOrderParam"])
+        self.moment.orders += 1
+        return identifier
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:
         self.session.run(f"""
-            print("[DOS 回测] 开始设置 VWAP 成交量分布，记录数=" + string({volume}.rows()))
             Backtest::setTradingVolumeDist(engine, {volume})
-            print("[DOS 回测] VWAP 成交量分布已设置")
             NULL
         """)
 
@@ -290,27 +275,23 @@ class Backtest(ABC, Generic[C]):
         label: str = "",
     ) -> None:
         try:
-            self.upload(
+            self.session.upload(
                 {
                     "cancelSymbol": symbol,
                     "cancelLabel": label,
                     "cancelIds": np.asarray(orders if orders is not None else [], dtype=np.int64),
-                },
-                "撤单参数",
+                }
             )
             self.session.run("""
-                print("[DOS 撤单] 开始提交撤单，证券=" + cancelSymbol + "，指定编号数=" + string(size(cancelIds)))
                 Backtest::cancelOrder(engine, cancelSymbol, cancelIds, cancelLabel)
-                print("[DOS 撤单] 撤单请求已提交")
                 NULL
             """)
         finally:
             self.release(["cancelSymbol", "cancelLabel", "cancelIds"])
 
     def get_records(self, expression: str, model: type[T]) -> list[T]:
-        columns = self.download(
-            f"(def(records) {{ return dict(records.columnNames(), records.values()) }})({expression})",
-            f"回测记录 {model.__name__}",
+        columns = self.session.run(
+            f"(def(records) {{ return dict(records.columnNames(), records.values()) }})({expression})"
         )
         return [
             model.model_validate(dict(zip(columns, row, strict=True)))
@@ -325,20 +306,16 @@ class Backtest(ABC, Generic[C]):
 
     def get_orders(self) -> list[OrderReport]:
         return [
-            OrderReport.model_validate(record)
-            for record in self.download("getOrders(engine)", "未消费订单回报")
+            OrderReport.model_validate(record) for record in self.session.run("getOrders(engine)")
         ]
 
     def get_trades(self) -> list[TradeReport]:
         return [
-            TradeReport.model_validate(record)
-            for record in self.download("getTrades(engine)", "未消费成交回报")
+            TradeReport.model_validate(record) for record in self.session.run("getTrades(engine)")
         ]
 
     def get_context(self) -> EngineContext:
-        return EngineContext.model_validate(
-            self.download("Backtest::getContextDict(engine)", "引擎状态")
-        )
+        return EngineContext.model_validate(self.session.run("Backtest::getContextDict(engine)"))
 
     def get_trade_details(self) -> list[TradeDetail]:
         return self.get_records("Backtest::getTradeDetails(engine)", TradeDetail)
@@ -357,10 +334,8 @@ class Backtest(ABC, Generic[C]):
     def finish(self, msg: DosVar) -> None:
         try:
             self.session.run(f"""
-                print("[DOS 回测] 开始准备结束消息")
                 endMsg = select top 1 * from {msg}
                 update endMsg set symbol = "END", timestamp = timestamp + 1
-                print("[DOS 回测] 结束消息已准备：" + string(endMsg.timestamp[0]))
                 NULL
             """)
             self.advance(DosVar("endMsg"))
@@ -373,9 +348,7 @@ class Backtest(ABC, Generic[C]):
             return
         try:
             self.session.run("""
-                print("[DOS 回测] 开始回收引擎")
                 Backtest::dropBacktestEngine(engine)
-                print("[DOS 回测] 引擎已回收")
                 NULL
             """)
         finally:
