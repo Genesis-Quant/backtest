@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Any, Generic, Literal, Self, Sequence, TypeVar, final
+from typing import Any, Generic, Iterator, Literal, Self, Sequence, TypeVar, final
 
 import dolphindb as ddb
 import numpy as np
@@ -118,6 +118,7 @@ class Backtest(ABC, Generic[C]):
         try:
             self.config = {
                 "enableAlgoOrder": True,
+                "outputOrderInfo": True,
                 **config,
                 "startDate": np.datetime64(config["startDate"], "D"),
                 "endDate": np.datetime64(config["endDate"], "D"),
@@ -137,6 +138,7 @@ class Backtest(ABC, Generic[C]):
             self.printed_batch_time: np.datetime64 | None = None
             self.ctx = ctx
             self.algos = tuple(algos)
+            self.event_dispatches: list[tuple[str, Any, Iterator[Algo[Any, C]]]] = []
             for algo in self.algos:
                 algo.backtest = self
                 algo.ctx = self.ctx
@@ -189,21 +191,13 @@ class Backtest(ABC, Generic[C]):
                     return dict(`kind`reports`eventsEmpty,
                         [kind, reports, soloEventsEmpty(engine)])
                 }
-                def soloSubmitOrders(engineName, messages, labels, kinds, settings, hasSettings) {
+                def soloSubmitOrder(engineName, message, label, kind, settings, hasSettings) {
                     engine = objByName(engineName)
-                    identifiers = array(LONG, 0)
-                    for (i in 0:size(messages)) {
-                        if (!hasSettings[i]) {
-                            identifier = Backtest::submitOrder(engine, messages[i], labels[i], kinds[i])[0]
-                        } else {
-                            params = copy(settings[i])
-                            params["endTime"] = second(params["endTime"])
-                            if ("startTime" in params.keys()) params["startTime"] = second(params["startTime"])
-                            identifier = Backtest::submitOrder(engine, messages[i], labels[i], kinds[i],, params)[0]
-                        }
-                        identifiers.append!(long(identifier))
-                    }
-                    return dict(`ids`eventsEmpty, [identifiers, soloEventsEmpty(engine)])
+                    if (!hasSettings) return Backtest::submitOrder(engine, message, label, kind)[0]
+                    params = copy(settings)
+                    params["endTime"] = second(params["endTime"])
+                    if ("startTime" in params.keys()) params["startTime"] = second(params["startTime"])
+                    return Backtest::submitOrder(engine, message, label, kind,, params)[0]
                 }
                 def soloCancelOrder(engineName, symbol, identifiers, label) {
                     engine = objByName(engineName)
@@ -352,8 +346,22 @@ class Backtest(ABC, Generic[C]):
         self.on_event("on_trade", trades)
 
     def on_event(self, callback: str, payload: Any) -> None:
-        for algo in reversed(self.algos):
-            getattr(algo, callback)(payload)
+        dispatch = (callback, payload, iter(reversed(self.algos)))
+        self.event_dispatches.append(dispatch)
+        try:
+            self.complete_event_dispatches()
+        finally:
+            self.event_dispatches.pop()
+
+    def complete_event_dispatches(self) -> None:
+        for callback, payload, remaining in self.event_dispatches:
+            try:
+                for algo in remaining:
+                    getattr(algo, callback)(payload)
+            except BaseException:
+                for _ in remaining:
+                    pass
+                raise
 
     def next_event_batch(self) -> EventBatch:
         """实时读取并同步清空一个队列，orders 优先；不预取、不延迟确认。"""
@@ -372,7 +380,8 @@ class Backtest(ABC, Generic[C]):
         return batch.kind, batch.reports
 
     def process_events(self, msg: DosVar | None = None) -> None:
-        """排空回报后分发行情，再排空回调产生的回报；允许回调内重入。"""
+        """重入时先通知当前事件的剩余接收者，再排空回报及分发行情。"""
+        self.complete_event_dispatches()
         while True:
             kind, reports = self.next_events()
             if kind:
@@ -453,42 +462,37 @@ class Backtest(ABC, Generic[C]):
         self.on_advance(snapshot)
 
     def submit_order(self, order: Order) -> int:
-        """同步提交单笔委托；直接进入运输层，不反向调用公开批量 hook。"""
-        return self.send_orders([order])[0]
+        """同步提交单笔委托并返回真实编号，回报留给 process_events 分发。"""
+        settings = order.algo_params()
+        identifier = int(
+            self.session.run(
+                "soloSubmitOrder",
+                "engine",
+                order.to_dos(),
+                order.label,
+                np.int32(order.kind),
+                settings,
+                settings is not None,
+            )
+        )
+        self.moment.orders += 1
+        self.record_operation("submit", 1)
+        return identifier
 
     def submit_orders(self, orders: Sequence[Order]) -> list[int]:
-        """按输入顺序同步提交，默认一次 RPC，不交错分发回报。
+        """逐笔调用 submit_order，排空当前回报后才提交下一笔。
 
-        子类若覆写 submit_order，则逐笔调用该 hook，保留其价格或风控逻辑；
-        hook 内可安全调用 super().submit_order，不会递归进入本批量接口。
+        保留输入顺序和单笔覆写；回调抛出异常时停止提交后续委托。
         """
-        submit = self.submit_order
-        if getattr(submit, "__func__", None) is not Backtest.submit_order:
-            scope = self.event_log("submit") if self.batch_log is None else nullcontext()
-            with scope:
-                return [submit(order) for order in orders]
-        return self.send_orders(orders)
-
-    def send_orders(self, orders: Sequence[Order]) -> list[int]:
-        """一次 RPC 按序运输委托并返回真实编号；不调用公开下单 hook。"""
         if not orders:
             return []
-        messages = [order.to_dos() for order in orders]
-        labels = np.asarray([order.label for order in orders], dtype=str)
-        kinds = np.asarray([order.kind for order in orders], dtype=np.int32)
-        settings = [order.algo_params() for order in orders]
-        result = self.session.run(
-            "soloSubmitOrders",
-            "engine",
-            messages,
-            labels,
-            kinds,
-            settings,
-            np.asarray([item is not None for item in settings], dtype=bool),
-        )
-        identifiers = [int(identifier) for identifier in result["ids"]]
-        self.moment.orders += len(identifiers)
-        self.record_operation("submit", len(identifiers))
+        identifiers = []
+        scope = self.event_log("submit") if self.batch_log is None else nullcontext()
+        with scope:
+            self.process_events()
+            for order in orders:
+                identifiers.append(self.submit_order(order))
+                self.process_events()
         return identifiers
 
     def set_trading_volume_dist(self, volume: DosVar) -> None:
