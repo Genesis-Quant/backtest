@@ -86,7 +86,7 @@ class BatchLog:
             "cancel": "撤单",
         }
         return (
-            f"{self.time} 批次 {self.sequence} [{labels[self.event]}]："
+            f"批次 {self.sequence} [{labels[self.event]}]："
             f"提交 {self.orders}，撤单请求 {self.cancellations}，"
             f"委托回报 {self.order_reports}，成交 {self.trades}，拒单 {self.rejected}"
             + ("；处理失败" if self.failed else "")
@@ -134,6 +134,7 @@ class Backtest(ABC, Generic[C]):
             self._batch_log: BatchLog | None = None
             self._batch_day = np.datetime64("NaT", "D")
             self._batch_number = 0
+            self._printed_batch_time: np.datetime64 | None = None
             self.ctx = ctx
             self.algos = tuple(algos)
             for algo in self.algos:
@@ -307,7 +308,16 @@ class Backtest(ABC, Generic[C]):
             self._flush_batch_log(batch)
 
     def emit_batch(self, batch: BatchLog) -> None:
-        """一批 Python 回调及其新增操作完成后打印；没有变动的批次不输出。"""
+        """有变动时先打印一次时间，同一时点的后续批次只打印批次信息。"""
+        if not batch.changed:
+            return
+        moment = np.datetime64(batch.time, "ms")
+        previous = self._printed_batch_time
+        if previous is None or not (
+            previous == moment or (np.isnat(previous) and np.isnat(moment))
+        ):
+            print(moment, flush=True)
+            self._printed_batch_time = moment
         print(batch, flush=True)
 
     def _record_operation(self, event: str, count: int) -> None:

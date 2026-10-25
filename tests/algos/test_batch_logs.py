@@ -22,18 +22,65 @@ def test_order_batch_is_logged_once_not_per_order(make_engine: EngineFactory, ca
     engine.quote()
     identifiers = engine.submit_orders(orders())
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 1
-    assert "[批量委托]" in lines[0] and "提交 2" in lines[0]
+    assert len(lines) == 2
+    assert lines[0] == "2026-06-10T09:30:00.000"
+    assert lines[1].startswith("批次 1 [批量委托]") and "提交 2" in lines[1]
     engine.process_events()
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 2
     assert "[委托回调]" in lines[0] and "委托回报 4" in lines[0]
     assert "[成交回调]" in lines[1] and "成交 2" in lines[1]
+    assert all("2026-" not in line and line.startswith("批次 ") for line in lines)
     assert len(identifiers) == 2
     engine.process_events()
     engine.quote(3)
     engine.process_events(DosVar("msg"))
     assert capsys.readouterr().out == ""
+
+
+def test_changed_time_prints_one_header_and_keeps_same_day_batch_numbers(
+    make_engine: EngineFactory, capsys
+):
+    engine = make_engine([], None)
+    engine.quote()
+    engine.submit_orders(orders())
+    engine.process_events()
+    first = capsys.readouterr().out.splitlines()
+    assert first[0] == "2026-06-10T09:30:00.000"
+    assert len(first) == 4
+    engine.quote(3)
+    engine.process_events(DosVar("msg"))
+    assert capsys.readouterr().out == ""
+    engine.submit_orders(
+        [
+            order.model_copy(
+                update={
+                    "time": engine.time.astype("datetime64[us]").item(),
+                    "direction": Direction.SELL_CLOSE,
+                    "price": 9.9,
+                }
+            )
+            for order in orders()
+        ]
+    )
+    engine.process_events()
+    second = capsys.readouterr().out.splitlines()
+    assert second[0] == "2026-06-10T09:30:03.000"
+    assert len(second) == 4
+    assert second[1].startswith("批次 4 ")
+    assert all(line.startswith("批次 ") and "2026-" not in line for line in second[1:])
+    engine.finish(DosVar("msg"))
+    assert capsys.readouterr().out == ""
+
+
+def test_header_is_local_to_each_engine(make_engine: EngineFactory, capsys):
+    first, second = make_engine([], None), make_engine([], None)
+    for engine in (first, second):
+        engine.quote()
+        engine.submit_orders(orders())
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.count("2026-06-10T09:30:00.000") == 2
+    assert len(lines) == 4
 
 
 def test_callback_batches_drain_same_time_before_next_day(make_engine: EngineFactory, monkeypatch):
