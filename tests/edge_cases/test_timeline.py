@@ -1,5 +1,7 @@
 """空批次、非法跨度、半开区间边界和乱序行情。"""
 
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 from algos.conftest import EngineFactory, RecordingAlgo
@@ -87,3 +89,108 @@ def test_default_algo_callbacks_are_optional(make_engine: EngineFactory) -> None
     assert algo.ctx is engine.ctx
     assert engine.ctx.events == []
     assert engine.session.run("Backtest::getBacktestEngineStat(engine).status[0]") == "END"
+
+
+def test_preloaded_messages_use_local_timeline_and_one_rpc_per_step(
+    make_engine: EngineFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = make_engine([], None)
+    times = np.asarray(
+        ["2026-06-10T09:30:00", "2026-06-10T09:30:03", "2026-06-11T09:30:00"],
+        dtype="datetime64[ms]",
+    )
+    monkeypatch.setattr(engine, "load_messages", lambda start, end: DosVar("source"))
+    monkeypatch.setattr(
+        engine,
+        "load_timeline",
+        lambda message, start, end: times[(times >= start) & (times < end)],
+    )
+    engine.trusted_event_cache = True
+    run = Mock(wraps=engine.session.run)
+    upload = Mock(wraps=engine.session.upload)
+    monkeypatch.setattr(engine.session, "run", run)
+    monkeypatch.setattr(engine.session, "upload", upload)
+    engine.run(np.timedelta64(12, "h"))
+    scripts = [call.args[0] for call in run.call_args_list]
+    assert len(scripts) == 7  # 三次 step、END 准备/推进及两次结束清理。
+    assert sum("where timestamp = timestamp(" in script for script in scripts) == 3
+    assert not any("soloNextEvents" in script for script in scripts)
+    upload.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        ["2026-06-10T09:30:03", "2026-06-10T09:30:00"],
+        ["2026-06-10T09:30:00", "2026-06-10T09:30:00"],
+    ],
+)
+def test_local_timeline_must_be_strictly_increasing(
+    make_engine: EngineFactory, monkeypatch: pytest.MonkeyPatch, times: list[str]
+) -> None:
+    engine = make_engine([], None)
+    monkeypatch.setattr(
+        engine,
+        "load_timeline",
+        lambda message, start, end: np.asarray(times, dtype="datetime64[ms]"),
+    )
+    with pytest.raises(ValueError, match="行情时间轴必须严格递增"):
+        engine.run()
+    assert np.isnat(engine.time)
+
+
+def test_moment_is_emitted_only_after_advance_and_end_flushes_once(
+    make_engine: EngineFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = make_engine([], None)
+    emitted = []
+
+    def emit(moment) -> None:
+        if engine._finishing:
+            assert engine.session.run("Backtest::getBacktestEngineStat(engine).status[0]") == "END"
+        else:
+            server_time = engine.get_context().tradeTime
+            assert server_time is not None and np.datetime64(server_time, "ms") > moment.time
+        emitted.append(moment)
+
+    monkeypatch.setattr(engine, "emit_moment", emit)
+    engine.quote()
+    assert emitted == []
+    engine.quote(3)
+    assert [moment.time for moment in emitted] == [np.datetime64("2026-06-10T09:30:00", "ms")]
+    engine.finish(DosVar("msg"))
+    assert [moment.time for moment in emitted] == [
+        np.datetime64("2026-06-10T09:30:00", "ms"),
+        np.datetime64("2026-06-10T09:30:03", "ms"),
+    ]
+    assert np.isnat(engine.moment.time)
+
+
+def test_snapshot_extension_reads_prices_equity_and_position_in_same_advance(
+    make_engine: EngineFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = make_engine([], None)
+    snapshots = []
+    original_hook = engine.on_advance
+
+    def advanced(snapshot) -> None:
+        original_hook(snapshot)
+        snapshots.append(snapshot)
+
+    monkeypatch.setattr(
+        engine,
+        "snapshot_fields",
+        lambda msg: {
+            "prices": f"exec dict(string(symbol), lastPrice) from {msg}",
+            "equity": "exec first(totalEquity) from Backtest::getTotalPortfolios(engine)",
+            "positions": "(def(p) { return dict(p.columnNames(), p.values()) })(Backtest::getPosition(engine))",
+        },
+    )
+    monkeypatch.setattr(engine, "on_advance", advanced)
+    engine.quote()
+    assert len(snapshots) == 1
+    assert snapshots[0]["prices"] == {"000001.XSHE": 10.0, "600000.XSHG": 10.0}
+    assert snapshots[0]["equity"] == 1_000_000
+    assert snapshots[0]["quotes"] == 2
+    assert snapshots[0]["eventsEmpty"]
+    assert all(len(column) == 0 for column in snapshots[0]["positions"].values())
