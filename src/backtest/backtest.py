@@ -406,7 +406,7 @@ class Backtest(ABC, Generic[C]):
             with self.event_log("snapshot"):
                 self.on_snapshot(current)
 
-    def snapshot_fields(self, msg: DosVar) -> dict[str, str]:
+    def snapshot_fields(self, msg: DosVar) -> dict[str, str]:  # noqa: PLR6301 -- 供子类扩展的实例回调。
         """扩展 append 后的瞬时返回值，不由内核缓存或自动用于账户查询。
 
         字段名映射为 DOS 表达式；任何后续 session 操作、下单、回调或推进均

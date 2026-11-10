@@ -56,7 +56,7 @@ class Order(DosRecord, ABC):
         """按当前订单类型生成插件 msg 元组，并明确整数和时间的 DOS 类型。"""
         ...
 
-    def algo_params(self) -> dict[str, Any] | None:
+    def algo_params(self) -> dict[str, Any] | None:  # noqa: PLR6301 -- TWAP/VWAP 子类按实例参数扩展。
         """提供 TWAP/VWAP 专用参数；其他订单省略该参数。"""
         return None
 
